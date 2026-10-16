@@ -18,7 +18,9 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
 from . import prompts, render
+from .audit import NAMES, Audit, changelog_md, decisions_jsonl, reason_for
 from .llm import PlanningLLM
+from .persistence import check_repo, commit_specs
 from .state import (
     SRD,
     TRD,
@@ -42,6 +44,17 @@ class Settings:
     max_clarify_rounds: int = 4      # question rounds before moving on (open items shown at next gate)
     max_testability_rounds: int = 2  # self-check loops before showing leftover issues at SRD review
     output_dir: str = "planning_output"
+    specs_repo: str | None = None    # path to the project's git repo; set it to commit specs on every approval
+    specs_dir: str = "specs"         # folder inside specs_repo for the committed specs
+
+
+# which files each approval commits (plus the decision log)
+GATE_FILES = {
+    "scope": lambda st: {"scope.md": render.scope_md(st["scope"]), "feasibility.md": render.feasibility_md(st["feasibility"])},
+    "design": lambda st: {"design.md": render.design_md(st["design"]), "feasibility.md": render.feasibility_md(st["feasibility"])},
+    "srd": lambda st: {"SRD.md": render.srd_md(st["srd"]), "srd.json": render.as_json(st["srd"])},
+    "trd": lambda st: {"TRD.md": render.trd_md(st["trd"]), "trd.json": render.as_json(st["trd"])},
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +160,35 @@ def changed_ids(prev: dict | None, new: dict) -> list[str]:
 # node factory
 # --------------------------------------------------------------------------- #
 def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[str, Any]]]:
+    if s.specs_repo:
+        check_repo(s.specs_repo)
+
+    def _thread(config: RunnableConfig) -> str:
+        return str((config.get("configurable") or {}).get("thread_id", "run"))
+
+    def _recorded_review(state: PlanningState, config: RunnableConfig, gate: str, resp: dict) -> dict:
+        """Log the decision; on approval, commit the approved artifact with its reasons."""
+        a = Audit(state)
+        latest = a.latest(gate)
+        v = latest["version"] if latest else 0
+        a.event("review", gate=gate, artifact=NAMES[gate], version=v,
+                decision=resp["action"], feedback=resp.get("feedback"))
+        if resp["action"] == "approve" and s.specs_repo:
+            files = GATE_FILES[gate](state)
+            files["decisions.jsonl"] = decisions_jsonl(a.log)
+            files["CHANGELOG.md"] = changelog_md(a.log)
+            rejects = [e for e in a.log if e["event"] == "review" and e["gate"] == gate and e["decision"] == "reject"]
+            subject = f"specs: {NAMES[gate]} v{v} approved"
+            body = [f"Why this version: {latest['reason'] if latest else 'n/a'}"]
+            if latest and latest.get("changed"):
+                body.append(f"Changed: {', '.join(latest['changed'])}")
+            body.append(f"Rejections at this gate: {len(rejects)}")
+            body += [f"  - v{e['version']} rejected: {e['feedback']}" for e in rejects]
+            body.append(f"Planning run: {_thread(config)}")
+            sha = commit_specs(s.specs_repo, s.specs_dir, files, subject, "\n".join(body))
+            if sha:
+                a.event("committed", gate=gate, sha=sha, subject=subject)
+        return a.update()
 
     # ---------------- clarify (shared by both modes) ----------------
     def clarify_detect(state: PlanningState) -> dict:
@@ -178,7 +220,12 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
         answers = dict(state.get("answers") or {})
         for q in qs:
             answers[q["question"]] = str(resp[q["id"]]).strip()
-        update: dict = {"answers": answers, "open_questions": []}
+        a = Audit(state)
+        a.event("clarified", answers=[{
+            "id": q["id"], "question": q["question"], "answer": answers[q["question"]],
+            "source": f"requirement check ({q['req_id']})" if q.get("req_id") else "clarify",
+        } for q in qs])
+        update: dict = {"answers": answers, "open_questions": [], **a.update()}
         if not state.get("return_to"):
             update["clarify_rounds"] = state.get("clarify_rounds", 0) + 1
         return update
@@ -189,27 +236,34 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
         rej = state.get("last_rejection")
         if state.get("scope") and rej and rej.get("kind") == "scope":
             user += f"\n\nPREVIOUS DRAFT:\n{render.as_json(state['scope'])}\n\nREJECTION FEEDBACK:\n{rej['feedback']}"
-        scope = llm.structured(ScopeDoc, prompts.SCOPE, user)
-        return {"scope": scope.model_dump()}
+        scope = llm.structured(ScopeDoc, prompts.SCOPE, user).model_dump()
+        a = Audit(state)
+        a.version("scope", scope, render.scope_md(scope), reason_for(state))
+        return {"scope": scope, **a.update()}
 
     def feasibility(state: PlanningState) -> dict:
         if state.get("mode") == "design_first":
-            subject = render.design_md(state["design"])
+            subject, basis = render.design_md(state["design"]), "design"
         else:
-            subject = render.scope_md(state["scope"])
-        rep = llm.structured(FeasibilityReport, prompts.FEASIBILITY, f"{_context(state)}\n\nSUBJECT:\n{subject}")
-        return {"feasibility": rep.model_dump()}
+            subject, basis = render.scope_md(state["scope"]), "scope"
+        rep = llm.structured(FeasibilityReport, prompts.FEASIBILITY, f"{_context(state)}\n\nSUBJECT:\n{subject}").model_dump()
+        a = Audit(state)
+        latest = a.latest(basis)
+        a.version("feasibility", rep, render.feasibility_md(rep),
+                  f"assessed {NAMES[basis]} v{latest['version'] if latest else '?'} (verdict: {rep['verdict']})")
+        return {"feasibility": rep, **a.update()}
 
-    def scope_review(state: PlanningState) -> dict:
+    def scope_review(state: PlanningState, config: RunnableConfig) -> dict:
         resp = _review("scope", {
             "artifact": render.scope_md(state["scope"]),
             "feasibility": render.feasibility_md(state["feasibility"]),
             "unresolved_questions": state.get("unresolved_questions") or [],
         })
+        audit = _recorded_review(state, config, "scope", resp)
         if resp["action"] == "approve":
-            return {"approved": _approved(state, "scope", True), "last_rejection": None}
+            return {"approved": _approved(state, "scope", True), "last_rejection": None, **audit}
         rej = Rejection(gate="scope", feedback=resp["feedback"]).model_dump()
-        return {"approved": _approved(state, "scope", False), "last_rejection": rej}
+        return {"approved": _approved(state, "scope", False), "last_rejection": rej, **audit}
 
     # ---------------- SRD ----------------
     def draft_srd(state: PlanningState) -> dict:
@@ -232,7 +286,10 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
 
         new = llm.structured(SRD, prompts.SRD, user).model_dump()
         srd = merge_srd(prev, new, affected) if (prev and affected) else new
-        return {"srd": srd, "changed_req_ids": changed_ids(prev, srd), "return_to": None}
+        changed = changed_ids(prev, srd)
+        a = Audit(state)
+        a.version("srd", srd, render.srd_md(srd), reason_for(state), changed)
+        return {"srd": srd, "changed_req_ids": changed, "return_to": None, **a.update()}
 
     def testability_check(state: PlanningState) -> dict:
         srd = state["srd"]
@@ -247,19 +304,21 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
         if not issues:
             return {"testability_issues": []}
 
+        a = Audit(state)
+        a.event("self_check", check="testability", issues=[i.model_dump() for i in issues])
         iters, n = _bump(state, "testability")
         if n > s.max_testability_rounds:
             # Stop looping; show what is left to the user at SRD review instead.
-            return {"testability_issues": [i.model_dump() for i in issues], "iterations": iters}
+            return {"testability_issues": [i.model_dump() for i in issues], "iterations": iters, **a.update()}
 
         questions = [Question(id=f"T-{i.req_id}", question=i.question, why_it_matters=i.reason,
                               req_id=i.req_id).model_dump() for i in issues]
         rej = Rejection(gate="testability", kind="detail", feedback="; ".join(i.reason for i in issues),
                         affected_req_ids=sorted({i.req_id for i in issues})).model_dump()
         return {"open_questions": questions, "return_to": "draft_srd", "last_rejection": rej,
-                "iterations": iters, "testability_issues": []}
+                "iterations": iters, "testability_issues": [], **a.update()}
 
-    def srd_review(state: PlanningState) -> dict:
+    def srd_review(state: PlanningState, config: RunnableConfig) -> dict:
         rej = state.get("last_rejection")
         resp = _review("srd", {
             "artifact": render.srd_md(state["srd"], state.get("changed_req_ids")),
@@ -267,27 +326,31 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
             "open_testability_issues": state.get("testability_issues") or [],
             "unresolved_questions": state.get("unresolved_questions") or [],
         })
+        audit = _recorded_review(state, config, "srd", resp)
         if resp["action"] == "approve":
             iters = dict(state.get("iterations") or {})
             iters["testability"] = 0
-            return {"approved": _approved(state, "srd", True), "last_rejection": None, "iterations": iters}
+            return {"approved": _approved(state, "srd", True), "last_rejection": None, "iterations": iters, **audit}
         return {"approved": _approved(state, "srd", False),
-                "last_rejection": Rejection(gate="srd", feedback=resp["feedback"]).model_dump()}
+                "last_rejection": Rejection(gate="srd", feedback=resp["feedback"]).model_dump(), **audit}
 
     # ---------------- rejection routing ----------------
     def classify_rejection(state: PlanningState) -> dict:
         rej = dict(state["last_rejection"])
         design_first = state.get("mode") == "design_first"
 
+        method, rationale = "preset by the step that raised it", None
         if rej.get("kind") is None:
             if rej["gate"] == "scope":
                 rej["kind"] = "scope"                     # a scope-gate rejection is a scope problem by definition
+                method = "rule (scope gate)"
             elif rej["gate"] == "srd":
                 c = llm.structured(
                     RejectionClassification, prompts.CLASSIFY,
                     f"FEEDBACK:\n{rej['feedback']}\n\nSRD:\n{render.as_json(state['srd'])}",
                 )
                 rej["kind"], rej["affected_req_ids"] = c.kind, c.affected_req_ids
+                method, rationale = "LLM classifier", c.rationale
 
         if state.get("open_questions"):
             target = "clarify_ask"                        # TRD back-channel: ask first, then redraft SRD
@@ -299,12 +362,18 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
             target = "draft_srd"
 
         iters, n = _bump(state, rej["gate"])
+        escalate_now = n > s.max_rejections
+        a = Audit(state)
+        a.event("rejection_classified", gate=rej["gate"], kind=rej["kind"],
+                affected_req_ids=rej.get("affected_req_ids", []), method=method, rationale=rationale,
+                route="escalate to you" if escalate_now else target)
         return {
             "last_rejection": rej,
             "rejection_history": _history(state, rej),
             "iterations": iters,
             "pending_route": target,
-            "needs_escalation": n > s.max_rejections,
+            "needs_escalation": escalate_now,
+            **a.update(),
         }
 
     def escalate(state: PlanningState) -> dict:
@@ -325,11 +394,14 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
             if isinstance(resp, dict) and resp.get("action") in ("continue", "abort"):
                 break
             msg = {**payload, "error": "action must be 'continue' or 'abort'"}
+        a = Audit(state)
+        a.event("escalated", gate=gate, rejections=(state.get("iterations") or {}).get(gate, 0),
+                decision=resp["action"], guidance=str(resp.get("guidance", "")).strip() or None)
         if resp["action"] == "abort":
-            return {"status": "aborted", "needs_escalation": False}
+            return {"status": "aborted", "needs_escalation": False, **a.update()}
         iters = dict(state.get("iterations") or {})
         iters[gate] = 0
-        update: dict = {"needs_escalation": False, "iterations": iters}
+        update: dict = {"needs_escalation": False, "iterations": iters, **a.update()}
         if str(resp.get("guidance", "")).strip():
             update["last_rejection"] = {**rej, "feedback": f"{rej['feedback']}\nGuidance: {resp['guidance']}"}
         return update
@@ -361,27 +433,37 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
 
         trd["test_cases"] = [tc for tc in trd["test_cases"] if tc["req_id"] in req_ids]   # drop orphans
 
+        old_tcs = {tc["id"]: tc for tc in (prev or {}).get("test_cases", [])}
+        changed_tcs = [tc["id"] for tc in trd["test_cases"] if old_tcs.get(tc["id"]) != tc]
+        a = Audit(state)
+        srd_v = (a.latest("srd") or {}).get("version", "?")
+        a.version("trd", trd, render.trd_md(trd),
+                  reason_for(state, f"derived from SRD v{srd_v}") if local_feedback else f"derived from SRD v{srd_v}",
+                  changed_tcs)
+
         if trd.get("untestable"):
             issues = trd["untestable"]
+            a.event("self_check", check="TRD drafting (untestable requirements)", issues=issues)
             questions = [Question(id=f"T-{i['req_id']}", question=i["question"], why_it_matters=i["reason"],
                                   req_id=i["req_id"]).model_dump() for i in issues]
             rej = Rejection(gate="trd", kind="detail", feedback="Untestable: " + "; ".join(i["reason"] for i in issues),
                             affected_req_ids=sorted({i["req_id"] for i in issues})).model_dump()
             return {"trd": trd, "trd_outcome": "untestable", "last_rejection": rej,
-                    "open_questions": questions, "return_to": "draft_srd"}
-        return {"trd": trd, "trd_outcome": None}
+                    "open_questions": questions, "return_to": "draft_srd", **a.update()}
+        return {"trd": trd, "trd_outcome": None, **a.update()}
 
-    def trd_review(state: PlanningState) -> dict:
+    def trd_review(state: PlanningState, config: RunnableConfig) -> dict:
         trd = state["trd"]
         covered = {tc["req_id"] for tc in trd["test_cases"]}
         gaps = [r["id"] for r in state["srd"]["requirements"] if r["id"] not in covered]
         resp = _review("trd", {"artifact": render.trd_md(trd), "requirements_without_tests": gaps})
+        audit = _recorded_review(state, config, "trd", resp)
         if resp["action"] == "approve":
-            return {"trd_outcome": "approved", "approved": _approved(state, "trd", True), "last_rejection": None}
+            return {"trd_outcome": "approved", "approved": _approved(state, "trd", True), "last_rejection": None, **audit}
         rej = Rejection(gate="trd", feedback=resp["feedback"]).model_dump()
         iters, n = _bump(state, "trd")
         update = {"approved": _approved(state, "trd", False), "last_rejection": rej,
-                  "rejection_history": _history(state, rej), "iterations": iters}
+                  "rejection_history": _history(state, rej), "iterations": iters, **audit}
         if n > s.max_rejections:
             return {**update, "trd_outcome": "escalate", "needs_escalation": True, "pending_route": "trd"}
         return {**update, "trd_outcome": "rejected"}
@@ -392,20 +474,24 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
         rej = state.get("last_rejection")
         if state.get("design") and rej:
             user += f"\n\nPREVIOUS DESIGN:\n{render.as_json(state['design'])}\n\nFEEDBACK:\n{rej['feedback']}"
-        d = llm.structured(DesignDoc, prompts.DESIGN, user)
-        return {"design": d.model_dump(), "design_outcome": None}
+        d = llm.structured(DesignDoc, prompts.DESIGN, user).model_dump()
+        a = Audit(state)
+        a.version("design", d, render.design_md(d), reason_for(state))
+        return {"design": d, "design_outcome": None, **a.update()}
 
-    def design_review(state: PlanningState) -> dict:
+    def design_review(state: PlanningState, config: RunnableConfig) -> dict:
         resp = _review("design", {
             "artifact": render.design_md(state["design"]),
             "feasibility": render.feasibility_md(state["feasibility"]),
             "unresolved_questions": state.get("unresolved_questions") or [],
         })
+        audit = _recorded_review(state, config, "design", resp)
         if resp["action"] == "approve":
-            return {"design_outcome": "approved", "approved": _approved(state, "design", True), "last_rejection": None}
+            return {"design_outcome": "approved", "approved": _approved(state, "design", True),
+                    "last_rejection": None, **audit}
         rej = Rejection(gate="design", kind="design", feedback=resp["feedback"]).model_dump()
         iters, n = _bump(state, "design")
-        update = {"last_rejection": rej, "rejection_history": _history(state, rej), "iterations": iters}
+        update = {"last_rejection": rej, "rejection_history": _history(state, rej), "iterations": iters, **audit}
         if n > s.max_rejections:
             return {**update, "design_outcome": "escalate", "needs_escalation": True, "pending_route": "design"}
         return {**update, "design_outcome": "rejected"}
@@ -416,12 +502,14 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
             ConsistencyResult, prompts.CONSISTENCY,
             f"DESIGN:\n{render.as_json(state['design'])}\n\nSRD:\n{render.as_json(state['srd'])}",
         )
+        a = Audit(state)
+        a.event("consistency_check", gaps=[g.model_dump() for g in res.gaps])
         if not res.gaps:
-            return {"last_rejection": None}
+            return {"last_rejection": None, **a.update()}
         rej = Rejection(gate="consistency", kind="design",
                         feedback="Design gaps: " + "; ".join(f"{g.req_id}: {g.problem}" for g in res.gaps),
                         affected_req_ids=[g.req_id for g in res.gaps]).model_dump()
-        return {"last_rejection": rej}
+        return {"last_rejection": rej, **a.update()}
 
     # ---------------- handoff ----------------
     def handoff(state: PlanningState, config: RunnableConfig) -> dict:
@@ -439,14 +527,36 @@ def make_nodes(llm: PlanningLLM, s: Settings) -> dict[str, Callable[..., dict[st
             files["scope.md"] = render.scope_md(state["scope"])
         if state.get("design"):
             files["design.md"] = render.design_md(state["design"])
+
+        nxt = "testing" if state.get("mode") == "design_first" else "design"
+        a = Audit(state)
+        a.event("handoff", next_phase=nxt)
+        files["decisions.jsonl"] = decisions_jsonl(a.log)
+        files["CHANGELOG.md"] = changelog_md(a.log)
+        # every version of every artifact, with the reason and the diff to the previous one
+        for artifact, versions in a.versions.items():
+            for v in versions:
+                stem = f"versions/{NAMES[artifact]}_v{v['version']}"
+                files[f"{stem}.md"] = f"<!-- Why: {v['reason']} -->\n\n{v['markdown']}"
+                if v["diff"]:
+                    files[f"{stem}.diff"] = v["diff"]
+
         paths = {}
         for name, text in files.items():
             p = os.path.join(out, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(text)
             paths[name] = p
-        nxt = "testing" if state.get("mode") == "design_first" else "design"
-        return {"status": "handed_off", "next_phase": nxt, "artifact_paths": paths}
+
+        if s.specs_repo:
+            final = {"decisions.jsonl": files["decisions.jsonl"], "CHANGELOG.md": files["CHANGELOG.md"]}
+            sha = commit_specs(s.specs_repo, s.specs_dir, final, "specs: planning complete",
+                               f"Next phase: {nxt}\nPlanning run: {thread}")
+            if sha:
+                a.event("committed", gate="handoff", sha=sha, subject="specs: planning complete")
+
+        return {"status": "handed_off", "next_phase": nxt, "artifact_paths": paths, **a.update()}
 
     return {
         "clarify_detect": clarify_detect,

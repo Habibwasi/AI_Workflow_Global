@@ -130,7 +130,11 @@ def build_graph(llm: PlanningLLM, settings: Settings | None = None, checkpointer
 
 
 def initial_state(prompt: str, mode: str = "requirements_first") -> PlanningState:
+    from .audit import now
+
     return {
+        "audit_log": [{"ts": now(), "event": "run_started", "mode": mode, "prompt": prompt}],
+        "artifact_versions": {},
         "mode": mode, "prompt": prompt, "answers": {}, "open_questions": [], "unresolved_questions": [],
         "clarify_rounds": 0, "return_to": None, "scope": None, "feasibility": None, "design": None,
         "srd": None, "trd": None, "changed_req_ids": [], "testability_issues": [], "last_rejection": None,

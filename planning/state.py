@@ -173,6 +173,10 @@ class PlanningState(TypedDict, total=False):
     trd_outcome: Optional[Literal["approved", "untestable", "escalate"]]
     design_outcome: Optional[Literal["approved", "escalate"]]
 
+    # audit trail (see audit.py)
+    audit_log: list[dict]                       # every decision, oldest first
+    artifact_versions: dict[str, list[dict]]    # artifact -> [{version, reason, changed, content, markdown, diff}]
+
     # end
     status: Literal["running", "handed_off", "aborted"]
     next_phase: Optional[Literal["design", "testing"]]
