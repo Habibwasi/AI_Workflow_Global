@@ -1,0 +1,82 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	clarify_detect(clarify_detect)
+	clarify_ask(clarify_ask)
+	scope_draft(scope_draft)
+	feasibility(feasibility)
+	scope_review(scope_review)
+	draft_srd(draft_srd)
+	testability_check(testability_check)
+	srd_review(srd_review)
+	classify_rejection(classify_rejection)
+	escalate(escalate)
+	consistency_check(consistency_check)
+	handoff(handoff)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> clarify_detect;
+	clarify_ask --> clarify_detect;
+	clarify_detect -.-> clarify_ask;
+	clarify_detect -.-> design\3a__start__;
+	clarify_detect -.-> draft_srd;
+	clarify_detect -.-> scope_draft;
+	classify_rejection -.-> clarify_ask;
+	classify_rejection -.-> design\3a__start__;
+	classify_rejection -.-> draft_srd;
+	classify_rejection -.-> escalate;
+	classify_rejection -.-> scope_draft;
+	classify_rejection -.-> trd\3a__start__;
+	consistency_check -.-> classify_rejection;
+	consistency_check -.-> handoff;
+	design\3a__end__ -.-> draft_srd;
+	design\3a__end__ -.-> escalate;
+	draft_srd --> testability_check;
+	escalate -.-> __end__;
+	escalate -.-> clarify_ask;
+	escalate -.-> design\3a__start__;
+	escalate -.-> draft_srd;
+	escalate -.-> scope_draft;
+	escalate -.-> trd\3a__start__;
+	feasibility --> scope_review;
+	scope_draft --> feasibility;
+	scope_review -.-> classify_rejection;
+	scope_review -.-> draft_srd;
+	srd_review -.-> classify_rejection;
+	srd_review -.-> trd\3a__start__;
+	testability_check -.-> clarify_ask;
+	testability_check -.-> srd_review;
+	trd\3a__end__ -.-> classify_rejection;
+	trd\3a__end__ -.-> consistency_check;
+	trd\3a__end__ -.-> escalate;
+	trd\3a__end__ -.-> handoff;
+	handoff --> __end__;
+	subgraph trd
+	trd\3a__start__(<p>__start__</p>)
+	trd\3adraft_trd(draft_trd)
+	trd\3atrd_review(trd_review)
+	trd\3a__end__(<p>__end__</p>)
+	trd\3a__start__ --> trd\3adraft_trd;
+	trd\3adraft_trd -.-> trd\3a__end__;
+	trd\3adraft_trd -.-> trd\3atrd_review;
+	trd\3atrd_review -.-> trd\3a__end__;
+	trd\3atrd_review -.-> trd\3adraft_trd;
+	end
+	subgraph design
+	design\3a__start__(<p>__start__</p>)
+	design\3adesign_draft(design_draft)
+	design\3afeasibility(feasibility)
+	design\3adesign_review(design_review)
+	design\3a__end__(<p>__end__</p>)
+	design\3a__start__ --> design\3adesign_draft;
+	design\3adesign_draft --> design\3afeasibility;
+	design\3adesign_review -.-> design\3a__end__;
+	design\3adesign_review -.-> design\3adesign_draft;
+	design\3afeasibility --> design\3adesign_review;
+	end
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
