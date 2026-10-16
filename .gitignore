@@ -6,3 +6,4 @@ venv/
 .env
 planning_output/
 *.sqlite
+.workflow/

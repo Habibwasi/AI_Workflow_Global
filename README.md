@@ -15,8 +15,10 @@ planning/
   graph.py     wiring, mode router, TRD subgraph, design subgraph (Part 2 placeholder)
   render.py    markdown for review payloads and output files
   llm.py       PlanningLLM protocol + LangChain adapter (any provider)
+  audit.py     decision log + versioned artifacts with reasons and diffs
+  persistence.py  SQLite/Postgres checkpointers + git commit of approved specs
 run_cli.py     interactive terminal driver
-tests/         9 end-to-end route tests with a scripted fake LLM (no API key)
+tests/         15 tests with a scripted fake LLM (no API key): routes, audit trail, git, resume
 graph.mmd      Mermaid export of the compiled graph
 ```
 
@@ -30,10 +32,40 @@ export ANTHROPIC_API_KEY=...
 export PLANNING_MODEL=anthropic:claude-sonnet-5-5   # any LangChain "provider:model"
 python run_cli.py "Build a password reset flow" --mode requirements_first
 python run_cli.py "Build a password reset flow" --mode design_first
+
+python run_cli.py "..." --specs-repo ../my-project   # commit approved specs into your project repo
+python run_cli.py --thread <run id>                  # resume a stopped run
+python run_cli.py --thread <run id> --history        # list every saved step of a run
 ```
 
 Output files land in `planning_output/<thread_id>/`: `SRD.md`, `TRD.md`,
 `feasibility.md`, `scope.md` or `design.md`, plus `srd.json` / `trd.json` for Part 2.
+
+## History: why something changed, and how
+
+Three layers, each answering a different question:
+
+| Question | Where to look |
+|---|---|
+| Why did REQ-002 change, and who decided? | `CHANGELOG.md` / `decisions.jsonl`: every answer, review, classification, escalation, in order |
+| What exactly changed between versions? | `versions/SRD_v1.md`, `SRD_v2.md`, `SRD_v2.diff` (each file starts with the reason it exists) |
+| What did the approved specs look like on a given day? | `--specs-repo`: one git commit per approval in `<project>/specs/`, reason and rejection history in the commit message |
+| What was the full graph state at step N? Can I resume or branch from it? | the checkpointer (`.workflow/checkpoints.sqlite` by default): `--history`, `graph.get_state_history()`, replay, `graph.update_state()` to fork |
+
+Example commit message:
+
+```
+specs: SRD v2 approved
+
+Why this version: SRD review rejection: REQ-002 should expire after 30 minutes
+Changed: REQ-002
+Rejections at this gate: 1
+  - v1 rejected: REQ-002 should expire after 30 minutes
+Planning run: 522e1aaa-...
+```
+
+Only approvals are commits; rejections are recorded in the log that each commit carries.
+Committing skips when nothing changed, so re-running a step never creates duplicate commits.
 
 ## How the decisions map to code
 
@@ -60,9 +92,9 @@ Output files land in `planning_output/<thread_id>/`: `SRD.md`, `TRD.md`,
   appended by hand instead.
 - **State holds plain dicts**, so any checkpointer serialises it without registering
   custom types.
-- **Checkpointer:** `InMemorySaver` by default. For real use pass a persistent one, e.g.
-  `PostgresSaver` (`langgraph-checkpoint-postgres`) or `SqliteSaver`
-  (`langgraph-checkpoint-sqlite`): `build_graph(llm, checkpointer=...)`.
+- **Checkpointer:** the CLI uses SQLite (`planning.persistence.sqlite_checkpointer`).
+  `build_graph()` without one uses `InMemorySaver` (tests only: lost when the process stops).
+  For production use `postgres_checkpointer(conn_string)` (needs `langgraph-checkpoint-postgres`).
 
 ## Resume payloads
 

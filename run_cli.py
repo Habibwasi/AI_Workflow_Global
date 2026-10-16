@@ -4,6 +4,15 @@
     export PLANNING_MODEL=anthropic:claude-sonnet-5-5
     python run_cli.py --mode requirements_first "Build a password reset flow for our web app"
 
+    # commit every approved spec into your project's git repo, with the reasons
+    python run_cli.py "..." --specs-repo ../my-project
+
+    # stopped half-way? resume the same run later (state lives in .workflow/checkpoints.sqlite)
+    python run_cli.py --thread <run id>
+
+    # list every saved step of a run
+    python run_cli.py --thread <run id> --history
+
 Every pause (question, review, escalation) is printed; you answer in the terminal and
 the graph resumes from its checkpoint.
 """
@@ -16,6 +25,7 @@ import uuid
 from langgraph.types import Command
 
 from planning import ChatModelLLM, Settings, build_graph, initial_state
+from planning.persistence import sqlite_checkpointer
 
 
 def ask_user(payload: dict) -> dict:
@@ -59,19 +69,55 @@ def ask_user(payload: dict) -> dict:
     return json.loads(input("Resume JSON> "))
 
 
+def pending_interrupts(graph, config) -> list:
+    """Interrupts a stopped run is waiting on (empty if the thread is new or finished)."""
+    snap = graph.get_state(config)
+    return [i for task in snap.tasks for i in task.interrupts] if snap.next else []
+
+
+def print_history(graph, config) -> None:
+    snaps = list(graph.get_state_history(config))[::-1]          # oldest first
+    if not snaps:
+        print("No history for this thread.")
+        return
+    for s in snaps:
+        step = (s.metadata or {}).get("step")
+        nxt = ", ".join(s.next) or "(end)"
+        print(f"{s.created_at}  step {step:>3}  next: {nxt}  checkpoint: {s.config['configurable']['checkpoint_id']}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("prompt")
+    p.add_argument("prompt", nargs="?", help="What to build (omit when resuming with --thread)")
     p.add_argument("--mode", choices=["requirements_first", "design_first"], default="requirements_first")
     p.add_argument("--model", default=None)
-    p.add_argument("--thread", default=None, help="Reuse a thread id to resume (needs a persistent checkpointer)")
+    p.add_argument("--thread", default=None, help="Thread id of a run to resume or inspect")
+    p.add_argument("--db", default=".workflow/checkpoints.sqlite", help="SQLite file holding run history")
+    p.add_argument("--specs-repo", default=None, help="Project git repo: commit approved specs there")
+    p.add_argument("--history", action="store_true", help="List every saved step of --thread and exit")
     p.add_argument("--max-rejections", type=int, default=3)
     args = p.parse_args()
 
-    graph = build_graph(ChatModelLLM(args.model), Settings(max_rejections=args.max_rejections))
-    config = {"configurable": {"thread_id": args.thread or str(uuid.uuid4())}, "recursion_limit": 200}
+    settings = Settings(max_rejections=args.max_rejections, specs_repo=args.specs_repo)
+    graph = build_graph(ChatModelLLM(args.model) if not args.history else None, settings,
+                        checkpointer=sqlite_checkpointer(args.db))
+    thread = args.thread or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread}, "recursion_limit": 200}
 
-    result = graph.invoke(initial_state(args.prompt, args.mode), config)
+    if args.history:
+        print_history(graph, config)
+        return
+
+    pending = pending_interrupts(graph, config)
+    if pending:
+        print(f"Resuming run {thread}")
+        result = {"__interrupt__": pending}
+    elif args.prompt:
+        print(f"Run id: {thread}  (resume later with --thread {thread})")
+        result = graph.invoke(initial_state(args.prompt, args.mode), config)
+    else:
+        p.error("give a prompt to start a run, or --thread of a run that is waiting for you")
+
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
         result = graph.invoke(Command(resume=ask_user(payload)), config)
