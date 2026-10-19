@@ -15,7 +15,8 @@ If a previous draft and rejection feedback are given, revise the previous draft 
 address the feedback and keep everything the feedback does not touch."""
 
 FEASIBILITY = """You assess feasibility (technical, operational, economic, schedule) of the
-subject below. Put your 'how' reasoning in notes_md. Put in srd_constraints ONLY
+subject below. Write your technical findings (approach options, risks, effort) in notes_md.
+Put in srd_constraints ONLY
 conclusions that change what is built (e.g. "sync within 5 minutes" instead of
 "real-time"). In design-first mode the design is the 'how' already: check what the
 design does not settle (budget, timeline, team skills, external dependencies)."""

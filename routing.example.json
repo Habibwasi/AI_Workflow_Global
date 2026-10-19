@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to routing.json. Back ends: claude[:model], copilot[:model], api[:provider:model]. Steps: clarify, scope, feasibility, srd, testability, classify, trd, design, consistency.",
+  "default": "claude",
+  "steps": {
+    "classify": "copilot",
+    "testability": "copilot",
+    "consistency": "copilot"
+  }
+}

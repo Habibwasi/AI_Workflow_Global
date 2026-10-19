@@ -42,7 +42,7 @@ class ScopeDoc(BaseModel):
 
 class FeasibilityReport(BaseModel):
     verdict: Literal["feasible", "at_risk", "infeasible"]
-    notes_md: str = Field(description="The 'how' reasoning. Written to feasibility.md, never into the SRD")
+    notes_md: str = Field(description="Technical findings on how it could be built: approach options, risks, effort. Written to feasibility.md, never into the SRD")
     srd_constraints: list[str] = Field(
         default_factory=list,
         description="Only conclusions that change WHAT is built, e.g. 'sync within 5 minutes' instead of 'real-time'",
