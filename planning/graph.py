@@ -129,10 +129,11 @@ def build_graph(llm: PlanningLLM, settings: Settings | None = None, checkpointer
     return g.compile(checkpointer=checkpointer if checkpointer is not None else InMemorySaver())
 
 
-def initial_state(prompt: str, mode: str = "requirements_first") -> PlanningState:
+def initial_state(prompt: str, mode: str = "requirements_first", hide_trace_content: bool = False) -> PlanningState:
     from .audit import now
 
     return {
+        "hide_trace_content": hide_trace_content,
         "audit_log": [{"ts": now(), "event": "run_started", "mode": mode, "prompt": prompt}],
         "artifact_versions": {},
         "mode": mode, "prompt": prompt, "answers": {}, "open_questions": [], "unresolved_questions": [],

@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .graph import build_graph, initial_state
 from .llm import ChatModelLLM, PlanningLLM
 from .nodes import Settings

@@ -173,6 +173,9 @@ class PlanningState(TypedDict, total=False):
     trd_outcome: Optional[Literal["approved", "untestable", "escalate"]]
     design_outcome: Optional[Literal["approved", "escalate"]]
 
+    # observability: once a run starts with --no-content, every resume keeps it
+    hide_trace_content: bool
+
     # audit trail (see audit.py)
     audit_log: list[dict]                       # every decision, oldest first
     artifact_versions: dict[str, list[dict]]    # artifact -> [{version, reason, changed, content, markdown, diff}]
