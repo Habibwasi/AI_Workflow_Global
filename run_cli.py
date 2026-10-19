@@ -1,8 +1,11 @@
 """Interactive terminal driver for Part 1.
 
-    export ANTHROPIC_API_KEY=...            # or another provider's key
-    export PLANNING_MODEL=anthropic:claude-sonnet-5-5
+    # on your subscriptions (default): Claude Code and Copilot CLI, signed in once
     python run_cli.py --mode requirements_first "Build a password reset flow for our web app"
+    cp routing.example.json routing.json     # choose claude or copilot per step
+
+    # or on an API key
+    python run_cli.py "..." --llm api:anthropic:claude-sonnet-5-5
 
     # commit every approved spec into your project's git repo, with the reasons
     python run_cli.py "..." --specs-repo ../my-project
@@ -30,6 +33,7 @@ import uuid
 from langgraph.types import Command
 
 from planning import ChatModelLLM, Settings, build_graph, initial_state
+from planning.harness import HarnessError, load_routing
 from planning.persistence import sqlite_checkpointer
 from planning.tracing import trace_config, tracing_enabled, tracing_scope
 
@@ -92,11 +96,25 @@ def print_history(graph, config) -> None:
         print(f"{s.created_at}  step {step:>3}  next: {nxt}  checkpoint: {s.config['configurable']['checkpoint_id']}")
 
 
+def build_planning_llm(args):
+    """--llm/--routing pick the back end per step; --model alone keeps the old API behaviour."""
+    if args.model and not (args.llm or args.routing):
+        return ChatModelLLM(args.model), {"*": f"api:{args.model}"}
+    routing = args.routing or ("routing.json" if os.path.exists("routing.json") else None)
+    llm = load_routing(args.llm or "claude", routing)
+    return llm, llm.describe()
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("prompt", nargs="?", help="What to build (omit when resuming with --thread)")
     p.add_argument("--mode", choices=["requirements_first", "design_first"], default="requirements_first")
-    p.add_argument("--model", default=None)
+    p.add_argument("--llm", default=None,
+                   help="Default back end for every step: claude[:model] (your Claude plan), "
+                        "copilot[:model] (your Copilot plan) or api[:provider:model]. Default: claude")
+    p.add_argument("--routing", default=None,
+                   help="JSON file choosing a back end per step (default: ./routing.json if present)")
+    p.add_argument("--model", default=None, help="API model (provider:model). Same as --llm api:<model>")
     p.add_argument("--thread", default=None, help="Thread id of a run to resume or inspect")
     p.add_argument("--db", default=".workflow/checkpoints.sqlite", help="SQLite file holding run history")
     p.add_argument("--specs-repo", default=None, help="Project git repo: commit approved specs there")
@@ -109,8 +127,8 @@ def main() -> None:
     args = p.parse_args()
 
     settings = Settings(max_rejections=args.max_rejections, specs_repo=args.specs_repo)
-    graph = build_graph(ChatModelLLM(args.model) if not args.history else None, settings,
-                        checkpointer=sqlite_checkpointer(args.db))
+    llm, routes = (None, {}) if args.history else build_planning_llm(args)
+    graph = build_graph(llm, settings, checkpointer=sqlite_checkpointer(args.db))
     thread = args.thread or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread}, "recursion_limit": 200}
 
@@ -118,10 +136,12 @@ def main() -> None:
         print_history(graph, config)
         return
 
+    snap = graph.get_state(config)
     pending = pending_interrupts(graph, config)
-    if not pending and not args.prompt:
+    failed = bool(snap.next) and not pending          # a step raised (e.g. a plan's usage limit): retry it
+    if not (pending or failed) and not args.prompt:
         p.error("give a prompt to start a run, or --thread of a run that is waiting for you")
-    saved = graph.get_state(config).values if pending else {}
+    saved = snap.values if (pending or failed) else {}
     mode = saved.get("mode", args.mode)
     hide = args.no_content or bool(saved.get("hide_trace_content"))   # sticky for the whole run
     project = args.project or os.path.basename(os.path.abspath(args.specs_repo or os.getcwd()))
@@ -130,17 +150,28 @@ def main() -> None:
         what = "metadata only (--no-content)" if hide else "full content"
         print(f"LangSmith tracing on: project '{os.environ.get('LANGSMITH_PROJECT', 'default')}', {what}")
 
-    with tracing_scope(hide_content=hide):
-        if pending:
-            print(f"Resuming run {thread}")
-            result = {"__interrupt__": pending}
-        else:
-            print(f"Run id: {thread}  (resume later with --thread {thread})")
-            result = graph.invoke(initial_state(args.prompt, mode, hide_trace_content=hide), config)
+    if routes:
+        print("Model per step: " + ", ".join(f"{step}={spec}" for step, spec in routes.items()))
 
-        while "__interrupt__" in result:
-            payload = result["__interrupt__"][0].value
-            result = graph.invoke(Command(resume=ask_user(payload)), config)
+    try:
+        with tracing_scope(hide_content=hide):
+            if pending:
+                print(f"Resuming run {thread}")
+                result = {"__interrupt__": pending}
+            elif failed:
+                print(f"Resuming run {thread}: retrying {', '.join(snap.next)}")
+                result = graph.invoke(None, config)
+            else:
+                print(f"Run id: {thread}  (resume later with --thread {thread})")
+                result = graph.invoke(initial_state(args.prompt, mode, hide_trace_content=hide), config)
+
+            while "__interrupt__" in result:
+                payload = result["__interrupt__"][0].value
+                result = graph.invoke(Command(resume=ask_user(payload)), config)
+    except HarnessError as e:
+        print(f"\nStopped: {e}\nEverything up to this step is saved. Resume with: "
+              f"python run_cli.py --thread {thread}")
+        raise SystemExit(1)
 
     print(f"\nStatus: {result['status']}")
     if result.get("artifact_paths"):

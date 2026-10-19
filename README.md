@@ -18,8 +18,10 @@ planning/
   audit.py     decision log + versioned artifacts with reasons and diffs
   persistence.py  SQLite/Postgres checkpointers + git commit of approved specs
   tracing.py   LangSmith run names, tags, metadata, and metadata-only mode
+  harness.py   run steps on your subscriptions: Claude Code CLI, Copilot CLI, per-step routing
+routing.example.json  which back end each planning step uses
 run_cli.py     interactive terminal driver
-tests/         19 tests, no API key or network: routes, audit trail, git, resume, tracing
+tests/         33 tests, no API key or network: routes, audit trail, git, resume, tracing, harnesses
 graph.mmd      Mermaid export of the compiled graph
 ```
 
@@ -67,6 +69,54 @@ Planning run: 522e1aaa-...
 
 Only approvals are commits; rejections are recorded in the log that each commit carries.
 Committing skips when nothing changed, so re-running a step never creates duplicate commits.
+
+## Run on your subscriptions (no API keys)
+
+By default every planning step runs through **Claude Code** (`claude -p`) on your
+Claude plan. Any step can go to **GitHub Copilot CLI** (`copilot -p`) on your
+Copilot plan instead. The flow, review gates, audit log and git commits are
+unchanged; only how each step reaches a model differs.
+
+One-time setup:
+
+```bash
+npm install -g @anthropic-ai/claude-code && claude     # sign in with your Claude plan
+npm install -g @github/copilot && copilot              # sign in with GitHub
+cd ~/.ai_workflow/harness && copilot                   # trust the folder planning calls run in
+cp routing.example.json routing.json                   # choose a back end per step
+```
+
+`routing.json` (picked up automatically from the current folder, or pass `--routing`):
+
+```json
+{"default": "claude", "steps": {"classify": "copilot", "testability": "copilot", "consistency": "copilot"}}
+```
+
+Back ends: `claude[:model]` (e.g. `claude:sonnet`), `copilot[:model]`, or
+`api[:provider:model]` for an API key. Steps: `clarify`, `scope`, `feasibility`,
+`srd`, `testability`, `classify`, `trd`, `design`, `consistency`. The run prints
+which back end each step uses.
+
+How the calls are made:
+- They run in `~/.ai_workflow/harness`, an empty folder, so no project's CLAUDE.md,
+  hooks or MCP servers load, and they get **no tools**: no commands, file edits or web.
+- API-key variables are removed from the Claude call, so it always uses your plan.
+  (`--bare` mode is avoided on purpose: it skips the plan sign-in.)
+- Claude Code enforces the output schema itself. Copilot gets the schema in the
+  prompt; its answer is validated and retried once with the error.
+- If a plan's usage limit is hit mid-run, the run stops with a clear message and
+  everything so far is saved. `python run_cli.py --thread <run id>` retries the
+  failed step and continues.
+
+Measured on a real run (Claude Code CLI 2.1.303): a full requirements-first run with
+two rounds of requirement questions took about 5½ minutes and **16 Claude calls**,
+and produced 15 requirements and 61 acceptance tests. Each call draws on your plan's
+usage limits, shared with your own Claude Code use; each Copilot call, retries
+included, uses Copilot AI credits.
+
+Trade-offs against API keys: slower (a CLI starts per call), and LangSmith shows each
+call's prompt, answer and duration but not token counts or cost. Personal use only:
+Anthropic doesn't allow routing other people's requests through your plan sign-in.
 
 ## Observability with LangSmith
 
