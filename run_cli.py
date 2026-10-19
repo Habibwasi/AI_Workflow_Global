@@ -13,6 +13,10 @@
     # list every saved step of a run
     python run_cli.py --thread <run id> --history
 
+    # LangSmith observability (no code changes; see README)
+    export LANGSMITH_TRACING=true LANGSMITH_API_KEY=... LANGSMITH_PROJECT=ai-workflow
+    python run_cli.py "..." --no-content     # sensitive project: metadata only
+
 Every pause (question, review, escalation) is printed; you answer in the terminal and
 the graph resumes from its checkpoint.
 """
@@ -20,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 
 from langgraph.types import Command
 
 from planning import ChatModelLLM, Settings, build_graph, initial_state
 from planning.persistence import sqlite_checkpointer
+from planning.tracing import trace_config, tracing_enabled, tracing_scope
 
 
 def ask_user(payload: dict) -> dict:
@@ -96,6 +102,10 @@ def main() -> None:
     p.add_argument("--specs-repo", default=None, help="Project git repo: commit approved specs there")
     p.add_argument("--history", action="store_true", help="List every saved step of --thread and exit")
     p.add_argument("--max-rejections", type=int, default=3)
+    p.add_argument("--project", default=None,
+                   help="Project name for LangSmith filtering (default: folder name of --specs-repo or the current folder)")
+    p.add_argument("--no-content", action="store_true",
+                   help="LangSmith gets timings, tokens, errors and tags only: no prompts, answers or spec text")
     args = p.parse_args()
 
     settings = Settings(max_rejections=args.max_rejections, specs_repo=args.specs_repo)
@@ -109,18 +119,28 @@ def main() -> None:
         return
 
     pending = pending_interrupts(graph, config)
-    if pending:
-        print(f"Resuming run {thread}")
-        result = {"__interrupt__": pending}
-    elif args.prompt:
-        print(f"Run id: {thread}  (resume later with --thread {thread})")
-        result = graph.invoke(initial_state(args.prompt, args.mode), config)
-    else:
+    if not pending and not args.prompt:
         p.error("give a prompt to start a run, or --thread of a run that is waiting for you")
+    saved = graph.get_state(config).values if pending else {}
+    mode = saved.get("mode", args.mode)
+    hide = args.no_content or bool(saved.get("hide_trace_content"))   # sticky for the whole run
+    project = args.project or os.path.basename(os.path.abspath(args.specs_repo or os.getcwd()))
+    config.update(trace_config(mode=mode, project=project))
+    if tracing_enabled():
+        what = "metadata only (--no-content)" if hide else "full content"
+        print(f"LangSmith tracing on: project '{os.environ.get('LANGSMITH_PROJECT', 'default')}', {what}")
 
-    while "__interrupt__" in result:
-        payload = result["__interrupt__"][0].value
-        result = graph.invoke(Command(resume=ask_user(payload)), config)
+    with tracing_scope(hide_content=hide):
+        if pending:
+            print(f"Resuming run {thread}")
+            result = {"__interrupt__": pending}
+        else:
+            print(f"Run id: {thread}  (resume later with --thread {thread})")
+            result = graph.invoke(initial_state(args.prompt, mode, hide_trace_content=hide), config)
+
+        while "__interrupt__" in result:
+            payload = result["__interrupt__"][0].value
+            result = graph.invoke(Command(resume=ask_user(payload)), config)
 
     print(f"\nStatus: {result['status']}")
     if result.get("artifact_paths"):

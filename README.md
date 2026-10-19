@@ -17,8 +17,9 @@ planning/
   llm.py       PlanningLLM protocol + LangChain adapter (any provider)
   audit.py     decision log + versioned artifacts with reasons and diffs
   persistence.py  SQLite/Postgres checkpointers + git commit of approved specs
+  tracing.py   LangSmith run names, tags, metadata, and metadata-only mode
 run_cli.py     interactive terminal driver
-tests/         15 tests with a scripted fake LLM (no API key): routes, audit trail, git, resume
+tests/         19 tests, no API key or network: routes, audit trail, git, resume, tracing
 graph.mmd      Mermaid export of the compiled graph
 ```
 
@@ -66,6 +67,32 @@ Planning run: 522e1aaa-...
 
 Only approvals are commits; rejections are recorded in the log that each commit carries.
 Committing skips when nothing changed, so re-running a step never creates duplicate commits.
+
+## Observability with LangSmith
+
+Shows what the model did at every step: exact prompts and answers, tokens, cost,
+latency and errors. No code changes are needed; set these and run as usual:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=<your key>          # from smith.langchain.com
+export LANGSMITH_PROJECT=ai-workflow         # where runs appear in the UI
+# EU accounts: export LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+```
+
+- Every planning run shows as one **thread** (grouped by its run id), even across
+  pauses and restarts.
+- Filter by tags: `part:planning`, `mode:<mode>`, `project:<name>`; metadata also
+  carries `workflow_version`. Set the project name with `--project` (default: the
+  folder name of `--specs-repo`, or the current folder).
+- `--no-content` sends timings, tokens, errors, tags and model settings, but **no
+  inputs or outputs** (no prompts, answers or spec text). It sticks to the run:
+  resuming a run started with it keeps it, even if you forget the flag.
+- Traces are for debugging and monitoring, not a record: on LangSmith's published
+  plans base traces are kept 14 days. The decision log and git commits stay the
+  system of record.
+
+`tests/test_tracing.py` checks what is actually sent, against a local capture server.
 
 ## How the decisions map to code
 
